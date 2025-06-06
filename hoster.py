@@ -11,6 +11,7 @@ label_name = "hoster.domains"
 enclosing_pattern = "#-----------Docker-Hoster-Domains----------\n"
 hosts_path = "/tmp/hosts"
 hosts = {}
+traefik_hosts = set()
 
 def signal_handler(signal, frame):
     global hosts
@@ -63,7 +64,16 @@ def main():
                 update_hosts_file()
 
 
+def has_traefik_label(info):
+    for label in info['Config']['Labels']:
+        if label.startswith('traefik.http.routers'):
+            return True
+    return False
+
+
 def get_container_data(dockerClient, container_id):
+    global traefik_hosts
+    traefik_hosts = set()
     #extract all the info with the docker api
     info = dockerClient.inspect_container(container_id)
     container_hostname = info["Config"]["Hostname"]
@@ -71,10 +81,16 @@ def get_container_data(dockerClient, container_id):
     container_ip = info["NetworkSettings"]["IPAddress"]
     if info["Config"]["Domainname"]:
         container_hostname = container_hostname + "." + info["Config"]["Domainname"]
-    
+    if has_traefik_label(info):
+        traefik_hosts.add(container_name)
+
     result = []
 
-    for values in info["NetworkSettings"]["Networks"].values():
+    for name, values in info["NetworkSettings"]["Networks"].items():
+        network_info = dockerClient.inspect_network(name)
+        if network_info['Internal']:
+            # Not reachable from host, so no need to add to hosts file
+            continue
         
         if not values["Aliases"]: 
             continue
@@ -122,6 +138,8 @@ def update_hosts_file():
         
         for id, addresses in hosts.items():
             for addr in addresses:
+                if addr['name'] == 'traefik':
+                    addr['domains'] |= traefik_hosts
                 lines.append("%s    %s\n"%(addr["ip"],"   ".join(addr["domains"])))
         
         lines.append("#-----Do-not-add-hosts-after-this-line-----\n\n")
