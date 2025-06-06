@@ -1,11 +1,8 @@
-FROM frolvlad/alpine-python3
+FROM python:3.13.2-alpine
 
-RUN pip3 install docker
+RUN pip install docker
 RUN mkdir /hoster
 WORKDIR /hoster
 ADD hoster.py /hoster/
 
-CMD ["python3", "-u", "hoster.py"]
-
-
-
+CMD ["python", "-u", "hoster.py"]
