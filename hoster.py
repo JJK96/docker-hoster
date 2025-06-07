@@ -9,9 +9,12 @@ import os
 
 label_name = "hoster.domains"
 enclosing_pattern = "#-----------Docker-Hoster-Domains----------\n"
+enclosing_pattern_iptables = "#-----------Docker-Hoster-Rules----------\n"
 hosts_path = "/tmp/hosts"
+iptables_path = "/tmp/rules.v4"
 hosts = {}
 traefik_hosts = set()
+iptables_rules = set()
 
 def signal_handler(signal, frame):
     global hosts
@@ -27,6 +30,7 @@ def main():
     args = parse_args()
     global hosts_path
     hosts_path = args.file
+    iptables_path = args.iptables_path
 
     dockerClient = docker.APIClient(base_url='unix://%s' % args.socket)
     events = dockerClient.events(decode=True)
@@ -37,6 +41,7 @@ def main():
         hosts[container_id] = container
 
     update_hosts_file()
+    update_iptables_file()
 
     #listen for events to keep the hosts file updated
     for e in events:
@@ -49,6 +54,7 @@ def main():
             container = get_container_data(dockerClient, container_id)
             hosts[container_id] = container
             update_hosts_file()
+            update_iptables_file()
 
         if status=="stop" or status=="die" or status=="destroy":
             container_id = e["id"]
@@ -72,8 +78,6 @@ def has_traefik_label(info):
 
 
 def get_container_data(dockerClient, container_id):
-    global traefik_hosts
-    traefik_hosts = set()
     #extract all the info with the docker api
     info = dockerClient.inspect_container(container_id)
     container_hostname = info["Config"]["Hostname"]
@@ -88,8 +92,11 @@ def get_container_data(dockerClient, container_id):
 
     for name, values in info["NetworkSettings"]["Networks"].items():
         network_info = dockerClient.inspect_network(name)
-        if network_info['Internal']:
+        if 'isolated-from-host' in network_info['Labels']:
             # Not reachable from host, so no need to add to hosts file
+            gateway = network_info['IPAM']['Config'][0]['Gateway']
+            interface = 'br-' + network_info['Id'][:12]
+            iptables_rules.add(f"-A OUTPUT -s {gateway} -o {interface} -j DROP")
             continue
         
         if not values["Aliases"]: 
@@ -115,6 +122,8 @@ def update_hosts_file():
 
     for id,addresses in hosts.items():
         for addr in addresses:
+            if addr['name'] == 'traefik':
+                addr['domains'] |= traefik_hosts
             print("ip: %s domains: %s" % (addr["ip"], addr["domains"]))
 
     #read all the lines of thge original file
@@ -138,8 +147,6 @@ def update_hosts_file():
         
         for id, addresses in hosts.items():
             for addr in addresses:
-                if addr['name'] == 'traefik':
-                    addr['domains'] |= traefik_hosts
                 lines.append("%s    %s\n"%(addr["ip"],"   ".join(addr["domains"])))
         
         lines.append("#-----Do-not-add-hosts-after-this-line-----\n\n")
@@ -153,10 +160,46 @@ def update_hosts_file():
     shutil.move(aux_file_path, hosts_path)
 
 
+def update_iptables_file():
+    #read all the lines of thge original file
+    lines = []
+    with open(iptables_path,"r+") as hosts_file:
+        lines = hosts_file.readlines()
+
+    #remove all the lines after the known pattern
+    for i,line in enumerate(lines):
+        if line==enclosing_pattern_iptables:
+            lines = lines[:i]
+            break;
+
+    #remove all the trailing newlines on the line list
+    if lines:
+        while lines and lines[-1].strip()=="": lines.pop()
+
+    #append all the domain lines
+    if len(hosts)>0:
+        lines.append("\n\n"+enclosing_pattern_iptables)
+        lines.append("*filter\n")
+        
+        for line in iptables_rules:
+            lines.append(line + '\n')
+        
+        lines.append("COMMIT\n")
+        lines.append("#-----Do-not-add-rules-after-this-line-----\n\n")
+
+    #write it on the auxiliar file
+    aux_file_path = iptables_path+".aux"
+    with open(aux_file_path,"w") as aux_hosts:
+        aux_hosts.writelines(lines)
+
+    #replace etc/hosts with aux file, making it atomic
+    shutil.move(aux_file_path, iptables_path)
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Synchronize running docker container IPs with host /etc/hosts file.')
     parser.add_argument('socket', type=str, nargs="?", default="tmp/docker.sock", help='The docker socket to listen for docker events.')
-    parser.add_argument('file', type=str, nargs="?", default="/tmp/hosts", help='The /etc/hosts file to sync the containers with.')
+    parser.add_argument('file', type=str, nargs="?", default=hosts_path, help='The /etc/hosts file to sync the containers with.')
+    parser.add_argument('iptables_path', type=str, nargs='?', default=iptables_path, help='The iptables rules file to sync the containers with.')
     return parser.parse_args()
 
 if __name__ == '__main__':
