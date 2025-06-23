@@ -6,12 +6,24 @@ import signal
 import time
 import sys
 import os
+import random
+from pathlib import Path
+import datetime
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
+import yaml
 
 label_name = "hoster.domains"
 enclosing_pattern = "#-----------Docker-Hoster-Domains----------\n"
 enclosing_pattern_iptables = "#-----------Docker-Hoster-Rules----------\n"
 hosts_path = "/tmp/hosts"
 iptables_path = "/tmp/rules.v4"
+traefik_certs_path = "/tmp/certs"
+traefik_dynamic_path = "/tmp/traefik_config/traefik-dynamic.yaml"
 hosts = {}
 traefik_hosts = set()
 iptables_rules = set()
@@ -42,6 +54,7 @@ def main():
 
     update_hosts_file()
     update_iptables_file()
+    update_traefik_certs()
 
     #listen for events to keep the hosts file updated
     for e in events:
@@ -55,6 +68,7 @@ def main():
             hosts[container_id] = container
             update_hosts_file()
             update_iptables_file()
+            update_traefik_certs()
 
         if status=="stop" or status=="die" or status=="destroy":
             container_id = e["id"]
@@ -68,6 +82,7 @@ def main():
                 container = get_container_data(dockerClient, container_id)
                 hosts[container_id] = container
                 update_hosts_file()
+                update_traefik_certs()
 
 
 def has_traefik_label(info):
@@ -194,6 +209,63 @@ def update_iptables_file():
 
     #replace etc/hosts with aux file, making it atomic
     shutil.move(aux_file_path, iptables_path)
+
+def gen_cert(host):
+    one_day = datetime.timedelta(1, 0, 0)
+    private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend())
+    public_key = private_key.public_key()
+
+    builder = x509.CertificateBuilder()
+    builder = builder.subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+    builder = builder.issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+    builder = builder.not_valid_before(datetime.datetime.today() - one_day)
+    builder = builder.not_valid_after(datetime.datetime.today() + (one_day*365*5))
+    builder = builder.serial_number(x509.random_serial_number())
+    builder = builder.public_key(public_key)
+    builder = builder.add_extension(
+        x509.SubjectAlternativeName([
+            x509.DNSName(host),
+        ]),
+        critical=False)
+    builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+
+    certificate = builder.sign(
+        private_key=private_key, algorithm=hashes.SHA256(),
+        backend=default_backend())
+
+    return (certificate.public_bytes(serialization.Encoding.PEM),
+        private_key.private_bytes(serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()))
+
+def update_traefik_certs():
+    yaml_contents = {
+        "tls": {
+            "certificates": []
+        }
+    }
+
+    for host in traefik_hosts:
+        dir = Path(traefik_certs_path) / host
+        dir.mkdir(exist_ok=True)
+        cert_path = dir / "cert.pem"
+        key_path = dir / "key.pem"
+        yaml_contents['tls']['certificates'].append({
+            "certFile": f"/etc/certificates/{host}/cert.pem",
+            "keyFile": f"/etc/certificates/{host}/key.pem",
+        })
+        if cert_path.exists() and key_path.exists():
+            continue
+        cert, key = gen_cert(host)
+        with open(cert_path, "wb") as f:
+            f.write(cert)
+        with open(key_path, "wb") as f:
+            f.write(key)
+    with open(traefik_dynamic_path, 'w+') as f:
+        yaml.dump(yaml_contents, f)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Synchronize running docker container IPs with host /etc/hosts file.')

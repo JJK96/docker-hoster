@@ -1,6 +1,6 @@
 FROM python:3.13.2-alpine
 
-RUN pip install docker
+RUN pip install docker pyyaml cryptography
 RUN mkdir /hoster
 WORKDIR /hoster
 ADD hoster.py /hoster/
